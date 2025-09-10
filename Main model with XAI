@@ -1,0 +1,473 @@
+import os
+import math
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from tqdm import tqdm
+import time
+import cv2
+from matplotlib.backends.backend_pdf import PdfPages
+from sklearn.metrics import roc_curve, auc, confusion_matrix, precision_recall_fscore_support
+import seaborn as sns
+from sklearn.manifold import TSNE
+import captum
+from captum.attr import IntegratedGradients, Occlusion, LayerGradCam, NoiseTunnel
+from captum.attr import visualization as viz
+from PIL import Image
+# Set random seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+# ================================
+# Dataset Path
+# ================================
+DATASET_PATH = r"D:\Research\CSE IU Dl Research with Sujon Habib Sir\Sujon Paper Updated by Shafiq September 2025\ALL Sujon Doc Updated\Data\monkeypox_dataset_binary_with_gan\monkeypox_dataset_binary_with_gan"
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset path not found: {DATASET_PATH}")
+# Define class names
+CLASS_NAMES = ["Monkeypox_augmented", "Others_augmented"]
+
+# ================================
+# Function to create splits (fixed)
+# ================================
+def create_data_splits(base_path, train_ratio=0.7, valid_ratio=0.15, test_ratio=0.15):
+    # Create split directories if they don't exist
+    splits = ['train', 'valid', 'test']
+    for split in splits:
+        split_path = os.path.join(base_path, split)
+        if not os.path.exists(split_path):
+            os.makedirs(split_path)
+            # Create class subdirectories
+            for class_name in CLASS_NAMES:
+                os.makedirs(os.path.join(split_path, class_name), exist_ok=True)
+    # Check if splits already have data
+    if all(os.listdir(os.path.join(base_path, split, CLASS_NAMES[0])) for split in splits):
+        print("Data splits already exist. Skipping split creation.")
+        return
+    print("Creating data splits...")
+    # Process each class
+    for class_name in CLASS_NAMES:
+        class_path = os.path.join(base_path, class_name)
+        if not os.path.isdir(class_path):
+            print(f"Warning: Class directory {class_name} not found. Skipping.")
+            continue
+        # Get all image files
+        images = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        np.random.shuffle(images)
+        # Calculate split sizes
+        total = len(images)
+        train_size = int(train_ratio * total)
+        valid_size = int(valid_ratio * total)
+        # Split the data
+        train_images = images[:train_size]
+        valid_images = images[train_size:train_size + valid_size]
+        test_images = images[train_size + valid_size:]
+        # Copy files to respective directories
+        for split_name, split_images in zip(splits, [train_images, valid_images, test_images]):
+            for img in split_images:
+                src = os.path.join(class_path, img)
+                dst = os.path.join(base_path, split_name, class_name, img)
+                shutil.copy2(src, dst)
+        print(f"Class {class_name}: {len(train_images)} train, {len(valid_images)} valid, {len(test_images)} test")
+
+# ================================
+# Attention-LSTM + ViT Model
+# ================================
+class ViT_LSTM_Model(nn.Module):
+    def __init__(self, num_classes):
+        super(ViT_LSTM_Model, self).__init__()
+        # Pretrained ViT
+        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        self.vit.heads = nn.Identity()  # Remove classification head
+        # Freeze early layers for faster training
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        # Unfreeze the last few layers
+        for param in self.vit.encoder.layers[-3:].parameters():
+            param.requires_grad = True
+        # LSTM with attention
+        self.lstm = nn.LSTM(768, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.attn = nn.Linear(512, 1)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+        # Store attention weights for visualization
+        self.attention_weights = None
+    def forward(self, x):
+        # ViT feature extraction
+        features = self.vit(x)  # [B, 768]
+        # Add sequence dimension for LSTM
+        features = features.unsqueeze(1)  # [B, 1, 768]
+        lstm_out, _ = self.lstm(features)  # [B, 1, 512]
+        # Attention
+        attn_logits = self.attn(lstm_out)
+        attn_weights = torch.softmax(attn_logits, dim=1)  # [B, 1, 1]
+        self.attention_weights = attn_weights.detach().cpu().numpy()
+        context = torch.sum(attn_weights * lstm_out, dim=1)  # [B, 512]
+        x = F.relu(self.fc1(context))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+# ================================
+# Function to calculate metrics
+# ================================
+def calculate_metrics(y_true, y_pred):
+    # Calculate confusion matrix
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    # Calculate metrics
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0  # Recall
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    f1 = 2 * (precision * sensitivity) / (precision + sensitivity) if (precision + sensitivity) > 0 else 0
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    return precision, sensitivity, f1, specificity, accuracy
+
+# ================================
+# Function to plot confusion matrix
+# ================================
+def plot_confusion_matrix(y_true, y_pred, class_names, title, filename):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(title)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    with PdfPages(filename) as pdf:
+        pdf.savefig()
+    plt.close()
+
+# ================================
+# XAI Visualization Functions
+# ================================
+def get_sample_images(dataset, num_samples=4):
+    """Get sample images from each class for visualization"""
+    class_indices = {class_name: [] for class_name in dataset.classes}
+    for idx, (img_path, label) in enumerate(dataset.samples):
+        class_name = dataset.classes[label]
+        class_indices[class_name].append((img_path, label))
+    samples = []
+    for class_name in dataset.classes:
+        class_samples = class_indices[class_name][:num_samples // 2]
+        samples.extend(class_samples)
+    return samples
+
+def denormalize_image(tensor):
+    """Denormalize image tensor for visualization"""
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return tensor * std + mean
+
+def visualize_attention_maps(model, samples, device):
+    """Visualize attention maps for sample images"""
+    model.eval()
+    fig, axes = plt.subplots(2, len(samples), figsize=(20, 8))
+    if len(samples) == 1:
+        axes = axes.reshape(2, 1)
+    for i, (img_path, true_label) in enumerate(samples):
+        # Load and preprocess image
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img, (224, 224))
+        img_tensor = transform(Image.fromarray(img_resized)).unsqueeze(0).to(device)
+        # Get model prediction and attention
+        with torch.no_grad():
+            output = model(img_tensor)
+            pred_label = output.argmax(dim=1).item()
+            attention_weight = model.attention_weights[0, 0, 0]
+        # Original image
+        axes[0, i].imshow(img_resized)
+        axes[0, i].set_title(f"True: {CLASS_NAMES[true_label]}\nPred: {CLASS_NAMES[pred_label]}")
+        axes[0, i].axis('off')
+        # Attention heatmap
+        heatmap = np.zeros((224, 224))
+        heatmap[:, :] = attention_weight
+        axes[1, i].imshow(img_resized)
+        axes[1, i].imshow(heatmap, cmap='jet', alpha=0.5)
+        axes[1, i].set_title(f"Attention Weight: {attention_weight:.4f}")
+        axes[1, i].axis('off')
+    plt.tight_layout()
+    plt.savefig('attention_maps.pdf', bbox_inches='tight')
+    plt.close()
+
+def visualize_integrated_gradients(model, samples, device):
+    """Visualize Integrated Gradients attributions"""
+    model.eval()
+    ig = IntegratedGradients(model)
+    fig, axes = plt.subplots(2, len(samples), figsize=(20, 8))
+    if len(samples) == 1:
+        axes = axes.reshape(2, 1)
+    for i, (img_path, true_label) in enumerate(samples):
+        # Load and preprocess image
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img, (224, 224))
+        img_tensor = transform(Image.fromarray(img_resized)).unsqueeze(0).to(device)
+        img_tensor.requires_grad = True
+        # Get model prediction
+        with torch.no_grad():
+            output = model(img_tensor)
+            pred_label = output.argmax(dim=1).item()
+        # Calculate attributions
+        attributions = ig.attribute(img_tensor, target=pred_label, n_steps=50)
+        attributions = attributions.squeeze().cpu().detach().numpy()
+        # Normalize attributions
+        attributions = np.sum(attributions, axis=0)
+        attributions = (attributions - attributions.min()) / (attributions.max() - attributions.min() + 1e-8)
+        # Original image
+        axes[0, i].imshow(img_resized)
+        axes[0, i].set_title(f"True: {CLASS_NAMES[true_label]}\nPred: {CLASS_NAMES[pred_label]}")
+        axes[0, i].axis('off')
+        # Attributions heatmap
+        axes[1, i].imshow(attributions, cmap='hot')
+        axes[1, i].set_title("Integrated Gradients")
+        axes[1, i].axis('off')
+    plt.tight_layout()
+    plt.savefig('integrated_gradients.pdf', bbox_inches='tight')
+    plt.close()
+
+# ================================
+# Main execution block
+# ================================
+if __name__ == '__main__':
+    # ================================
+    # Create splits (train/valid/test)
+    # ================================
+    create_data_splits(DATASET_PATH)
+    # ================================
+    # Data Loaders
+    # ================================
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    train_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "train"), transform=transform)
+    val_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "valid"), transform=transform)
+    test_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "test"), transform=transform)
+    # Set num_workers to 0 for Windows compatibility
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
+    # Print dataset sizes
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+    print(f"Classes: {train_dataset.classes}")
+    # ================================
+    # Training setup
+    # ================================
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model = ViT_LSTM_Model(num_classes=len(train_dataset.classes)).to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+    EPOCHS = 1
+    train_acc_history, val_acc_history = [], []
+    train_loss_history, val_loss_history = [], []
+    total_train_time = 0
+    # ================================
+    # Training Loop
+    # ================================
+    for epoch in range(EPOCHS):
+        start_time = time.time()
+        # Training
+        model.train()
+        correct, total = 0, 0
+        train_loss = 0.0
+        # Progress bar for training
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]")
+        for imgs, labels in train_pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            # Update progress bar
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{correct / total:.4f}'
+            })
+        train_acc = correct / total
+        train_loss = train_loss / len(train_loader)
+        train_acc_history.append(train_acc)
+        train_loss_history.append(train_loss)
+        # Validation
+        model.eval()
+        correct, total = 0, 0
+        val_loss = 0.0
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [Val]")
+            for imgs, labels in val_pbar:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                # Update progress bar
+                val_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{correct / total:.4f}'
+                })
+        val_acc = correct / total
+        val_loss = val_loss / len(val_loader)
+        val_acc_history.append(val_acc)
+        val_loss_history.append(val_loss)
+        # Update learning rate
+        scheduler.step(val_acc)
+        epoch_time = time.time() - start_time
+        total_train_time += epoch_time
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Time: {epoch_time:.2f}s")
+
+    # ================================
+    # Evaluate final metrics
+    # ================================
+    def evaluate_metrics(loader, desc="Evaluating"):
+        model.eval()
+        all_labels = []
+        all_preds = []
+        all_probs = []
+        start_time = time.time()
+        with torch.no_grad():
+            eval_pbar = tqdm(loader, desc=desc)
+            for imgs, labels in eval_pbar:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                probs = F.softmax(outputs, dim=1)
+                _, preds = torch.max(outputs, 1)
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+                eval_pbar.set_postfix({
+                    'Acc': f'{(preds == labels).float().mean().item():.4f}'
+                })
+        eval_time = time.time() - start_time
+        return np.array(all_labels), np.array(all_preds), np.array(all_probs), eval_time
+
+    # Get predictions for all sets
+    y_true_train, y_pred_train, y_prob_train, train_eval_time = evaluate_metrics(train_loader, "Final Train")
+    y_true_val, y_pred_val, y_prob_val, val_eval_time = evaluate_metrics(val_loader, "Final Val")
+    y_true_test, y_pred_test, y_prob_test, test_eval_time = evaluate_metrics(test_loader, "Final Test")
+    # Calculate metrics for each set
+    train_precision, train_sensitivity, train_f1, train_specificity, train_accuracy = calculate_metrics(y_true_train,
+                                                                                                        y_pred_train)
+    val_precision, val_sensitivity, val_f1, val_specificity, val_accuracy = calculate_metrics(y_true_val, y_pred_val)
+    test_precision, test_sensitivity, test_f1, test_specificity, test_accuracy = calculate_metrics(y_true_test,
+                                                                                                   y_pred_test)
+    # Print metrics table
+    print("\n" + "=" * 120)
+    print(f"{'Metric':<20} {'Train':<15} {'Test':<15} {'Validation':<15}")
+    print("=" * 120)
+    print(
+        f"{'Precision (%)':<20} {train_precision * 100:<15.2f} {test_precision * 100:<15.2f} {val_precision * 100:<15.2f}")
+    print(
+        f"{'Sensitivity (%)':<20} {train_sensitivity * 100:<15.2f} {test_sensitivity * 100:<15.2f} {val_sensitivity * 100:<15.2f}")
+    print(f"{'F1-score (%)':<20} {train_f1 * 100:<15.2f} {test_f1 * 100:<15.2f} {val_f1 * 100:<15.2f}")
+    print(
+        f"{'Specificity (%)':<20} {train_specificity * 100:<15.2f} {test_specificity * 100:<15.2f} {val_specificity * 100:<15.2f}")
+    print(
+        f"{'Accuracy (%)':<20} {train_accuracy * 100:<15.2f} {test_accuracy * 100:<15.2f} {val_accuracy * 100:<15.2f}")
+    print(f"{'Time (s)':<20} {train_eval_time:<15.2f} {test_eval_time:<15.2f} {val_eval_time:<15.2f}")
+    print("=" * 120)
+    print(f"Total Training Time: {total_train_time:.2f} seconds")
+    print("=" * 120)
+
+    # ================================
+    # Generate XAI Visualizations
+    # ================================
+    print("\nGenerating XAI visualizations...")
+    samples = get_sample_images(test_dataset, num_samples=4)
+    
+    # 1. Attention Maps
+    print("1. Generating attention maps...")
+    visualize_attention_maps(model, samples, device)
+    
+    # 2. Integrated Gradients
+    print("2. Generating integrated gradients...")
+    visualize_integrated_gradients(model, samples, device)
+
+    # ================================
+    # Plot confusion matrices
+    # ================================
+    plot_confusion_matrix(y_true_train, y_pred_train, CLASS_NAMES,
+                          "Confusion Matrix - Training Set", "confusion_matrix_train.pdf")
+    plot_confusion_matrix(y_true_val, y_pred_val, CLASS_NAMES,
+                          "Confusion Matrix - Validation Set", "confusion_matrix_val.pdf")
+    plot_confusion_matrix(y_true_test, y_pred_test, CLASS_NAMES,
+                          "Confusion Matrix - Test Set", "confusion_matrix_test.pdf")
+    # ================================
+    # Save accuracy plots as separate PDFs
+    # ================================
+    # Training & validation accuracy
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, EPOCHS + 1), train_acc_history, label="Train Accuracy", marker='o')
+    plt.plot(range(1, EPOCHS + 1), val_acc_history, label="Validation Accuracy", marker='s')
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy")
+    plt.title("Training & Validation Accuracy")
+    plt.legend()
+    plt.grid(True)
+    with PdfPages("train_val_accuracy.pdf") as pdf:
+        pdf.savefig()
+    plt.close()
+    # Final accuracy bar chart
+    plt.figure(figsize=(8, 5))
+    bars = plt.bar(["Train", "Validation", "Test"], [train_accuracy, val_accuracy, test_accuracy],
+                   color=["#1f77b4", "#ff7f0e", "#2ca02c"])
+    plt.ylabel("Accuracy")
+    plt.title("Final Accuracies")
+    plt.ylim(0, 1)
+    plt.grid(axis="y", alpha=0.3)
+    # Add value labels on bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width() / 2., height,
+                 f'{height:.4f}',
+                 ha='center', va='bottom')
+    with PdfPages("final_accuracy.pdf") as pdf:
+        pdf.savefig()
+    plt.close()
+    # ================================
+    # Save training vs validation loss curve
+    # ================================
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(1, EPOCHS + 1), train_loss_history, label="Training Loss", marker='o')
+    plt.plot(range(1, EPOCHS + 1), val_loss_history, label="Validation Loss", marker='s')
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.title("Training & Validation Loss")
+    plt.legend()
+    plt.grid(True)
+    with PdfPages("train_val_loss.pdf") as pdf:
+        pdf.savefig()
+    plt.close()
+
+    
+    # ================================
+    # Print Summary
+    # ================================
+    print("\n" + "=" * 80)
+    print("XAI VISUALIZATIONS GENERATED")
+    
