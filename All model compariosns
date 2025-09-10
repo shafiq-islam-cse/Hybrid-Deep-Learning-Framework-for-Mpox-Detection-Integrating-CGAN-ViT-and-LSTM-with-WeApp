@@ -1,0 +1,701 @@
+import os
+import shutil
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_recall_fscore_support, accuracy_score
+from tqdm import tqdm
+import time
+import seaborn as sns
+from matplotlib.backends.backend_pdf import PdfPages
+import psutil
+import gc
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# ================================
+# Dataset Path
+# ================================
+DATASET_PATH = r"D:\Research\CSE IU Dl Research with Sujon Habib Sir\Sujon Paper Updated by Shafiq September 2025\ALL Sujon Doc Updated\Data\monkeypox_dataset_binary_with_gan\monkeypox_dataset_binary_with_gan"
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset path not found: {DATASET_PATH}")
+
+# Define class names
+CLASS_NAMES = ["Monkeypox_augmented", "Others_augmented"]
+
+
+# ================================
+# Function to create splits (from first code)
+# ================================
+def create_data_splits(base_path, train_ratio=0.7, valid_ratio=0.15, test_ratio=0.15):
+    # Create split directories if they don't exist
+    splits = ['train', 'valid', 'test']
+    for split in splits:
+        split_path = os.path.join(base_path, split)
+        if not os.path.exists(split_path):
+            os.makedirs(split_path)
+            # Create class subdirectories
+            for class_name in CLASS_NAMES:
+                os.makedirs(os.path.join(split_path, class_name), exist_ok=True)
+
+    # Check if splits already have data
+    if all(os.listdir(os.path.join(base_path, split, CLASS_NAMES[0])) for split in splits):
+        print("Data splits already exist. Skipping split creation.")
+        return
+
+    print("Creating data splits...")
+    # Process each class
+    for class_name in CLASS_NAMES:
+        class_path = os.path.join(base_path, class_name)
+        if not os.path.isdir(class_path):
+            print(f"Warning: Class directory {class_name} not found. Skipping.")
+            continue
+
+        # Get all image files
+        images = [f for f in os.listdir(class_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        np.random.shuffle(images)
+
+        # Calculate split sizes
+        total = len(images)
+        train_size = int(train_ratio * total)
+        valid_size = int(valid_ratio * total)
+
+        # Split the data
+        train_images = images[:train_size]
+        valid_images = images[train_size:train_size + valid_size]
+        test_images = images[train_size + valid_size:]
+
+        # Copy files to respective directories
+        for split_name, split_images in zip(splits, [train_images, valid_images, test_images]):
+            for img in split_images:
+                src = os.path.join(class_path, img)
+                dst = os.path.join(base_path, split_name, class_name, img)
+                shutil.copy2(src, dst)
+
+        print(f"Class {class_name}: {len(train_images)} train, {len(valid_images)} valid, {len(test_images)} test")
+
+
+# ================================
+# Create splits
+# ================================
+create_data_splits(DATASET_PATH)
+
+# ================================
+# Data Loaders
+# ================================
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+train_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "train"), transform=transform)
+val_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "valid"), transform=transform)
+test_dataset = datasets.ImageFolder(os.path.join(DATASET_PATH, "test"), transform=transform)
+
+# Print dataset sizes
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+print(f"Classes: {train_dataset.classes}")
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0, pin_memory=False)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
+
+
+# ================================
+# Model Definitions
+# ================================
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super(Attention, self).__init__()
+        self.attention = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        attention_weights = torch.softmax(self.attention(x), dim=1)
+        context = torch.sum(attention_weights * x, dim=1)
+        return context
+
+
+class ViT_LSTM_Attention(nn.Module):
+    def __init__(self, num_classes):
+        super(ViT_LSTM_Attention, self).__init__()
+        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        self.vit.heads = nn.Identity()
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        for param in self.vit.encoder.layers[-3:].parameters():
+            param.requires_grad = True
+        self.lstm = nn.LSTM(768, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.attention = Attention(512)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.vit(x)
+        features = features.unsqueeze(1)
+        lstm_out, _ = self.lstm(features)
+        context = self.attention(lstm_out)
+        x = F.relu(self.fc1(context))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+class ViT_LSTM(nn.Module):
+    def __init__(self, num_classes):
+        super(ViT_LSTM, self).__init__()
+        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        self.vit.heads = nn.Identity()
+        for param in self.vit.parameters():
+            param.requires_grad = False
+        for param in self.vit.encoder.layers[-3:].parameters():
+            param.requires_grad = True
+        self.lstm = nn.LSTM(768, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.vit(x)
+        features = features.unsqueeze(1)
+        lstm_out, _ = self.lstm(features)
+        x = lstm_out[:, -1, :]
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+class MobileNet_LSTM_Attention(nn.Module):
+    def __init__(self, num_classes):
+        super(MobileNet_LSTM_Attention, self).__init__()
+        self.mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+        self.mobilenet.classifier = nn.Identity()
+        for param in self.mobilenet.parameters():
+            param.requires_grad = False
+        for param in self.mobilenet.features[-3:].parameters():
+            param.requires_grad = True
+        self.lstm = nn.LSTM(1280, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.attention = Attention(512)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.mobilenet(x)
+        features = features.unsqueeze(1)
+        lstm_out, _ = self.lstm(features)
+        context = self.attention(lstm_out)
+        x = F.relu(self.fc1(context))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+class MobileNet_LSTM(nn.Module):
+    def __init__(self, num_classes):
+        super(MobileNet_LSTM, self).__init__()
+        self.mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+        self.mobilenet.classifier = nn.Identity()
+        for param in self.mobilenet.parameters():
+            param.requires_grad = False
+        for param in self.mobilenet.features[-3:].parameters():
+            param.requires_grad = True
+        self.lstm = nn.LSTM(1280, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.mobilenet(x)
+        features = features.unsqueeze(1)
+        lstm_out, _ = self.lstm(features)
+        x = lstm_out[:, -1, :]
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+class VGG16_LSTM(nn.Module):
+    def __init__(self, num_classes):
+        super(VGG16_LSTM, self).__init__()
+        self.vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        self.vgg.classifier = nn.Identity()
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        for param in self.vgg.features[-3:].parameters():
+            param.requires_grad = True
+        self.lstm = nn.LSTM(512, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.vgg(x)
+        features = features.view(features.size(0), -1).unsqueeze(1)
+        lstm_out, _ = self.lstm(features)
+        x = lstm_out[:, -1, :]
+        x = F.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+class GRU_MobileNet_Attention(nn.Module):
+    def __init__(self, num_classes):
+        super(GRU_MobileNet_Attention, self).__init__()
+        self.mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+        self.mobilenet.classifier = nn.Identity()
+        for param in self.mobilenet.parameters():
+            param.requires_grad = False
+        for param in self.mobilenet.features[-3:].parameters():
+            param.requires_grad = True
+        self.gru = nn.GRU(1280, 256, batch_first=True, bidirectional=True, num_layers=2, dropout=0.3)
+        self.attention = Attention(512)
+        self.fc1 = nn.Linear(512, 128)
+        self.dropout1 = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(128, 32)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc_out = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        features = self.mobilenet(x)
+        features = features.unsqueeze(1)
+        gru_out, _ = self.gru(features)
+        context = self.attention(gru_out)
+        x = F.relu(self.fc1(context))
+        x = self.dropout1(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout2(x)
+        out = self.fc_out(x)
+        return out
+
+
+# ================================
+# Utility Functions
+# ================================
+def get_model_size(model):
+    """Get model size in MB"""
+    param_size = 0
+    buffer_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    size_mb = (param_size + buffer_size) / 1024 ** 2
+    return size_mb
+
+
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 ** 2
+
+
+def count_parameters(model):
+    """Count the number of trainable parameters in a model"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ================================
+# Training and Evaluation Functions
+# ================================
+def train_model(model, train_loader, val_loader, epochs=50, lr=1e-4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+    train_acc_history, val_acc_history = [], []
+    total_training_time = 0
+    # Get initial memory usage
+    initial_memory = get_memory_usage()
+    peak_memory = initial_memory
+
+    for epoch in range(epochs):
+        start_time = time.time()
+        # Training
+        model.train()
+        correct, total = 0, 0
+        train_loss = 0.0
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")
+        for imgs, labels in train_pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, preds = torch.max(outputs, 1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            # Update peak memory
+            current_memory = get_memory_usage()
+            if current_memory > peak_memory:
+                peak_memory = current_memory
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{correct / total:.4f}'
+            })
+
+        train_acc = correct / total
+        train_loss = train_loss / len(train_loader)
+        train_acc_history.append(train_acc)
+
+        # Validation
+        model.eval()
+        correct, total = 0, 0
+        val_loss = 0.0
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Val]")
+            for imgs, labels in val_pbar:
+                imgs, labels = imgs.to(device), labels.to(device)
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, preds = torch.max(outputs, 1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+                val_pbar.set_postfix({
+                    'Loss': f'{loss.item():.4f}',
+                    'Acc': f'{correct / total:.4f}'
+                })
+
+        val_acc = correct / total
+        val_loss = val_loss / len(val_loader)
+        val_acc_history.append(val_acc)
+        scheduler.step(val_acc)
+        epoch_time = time.time() - start_time
+        total_training_time += epoch_time
+        print(
+            f"Epoch {epoch + 1}/{epochs} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Time: {epoch_time:.2f}s")
+
+    # Calculate memory increase
+    memory_increase = peak_memory - initial_memory
+    return model, train_acc_history, val_acc_history, total_training_time, memory_increase
+
+
+def evaluate_model(model, data_loader, dataset_name):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    # Measure inference time
+    start_time = time.time()
+    with torch.no_grad():
+        for imgs, labels in tqdm(data_loader, desc=f"Evaluating {dataset_name}"):
+            imgs, labels = imgs.to(device), labels.to(device)
+            outputs = model(imgs)
+            probs = F.softmax(outputs, dim=1)[:, 1]
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+    inference_time = time.time() - start_time
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary')
+    # Calculate AUC
+    fpr, tpr, _ = roc_curve(all_labels, all_probs)
+    roc_auc = auc(fpr, tpr)
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': roc_auc,
+        'confusion_matrix': cm,
+        'fpr': fpr,
+        'tpr': tpr,
+        'all_labels': all_labels,
+        'all_preds': all_preds,
+        'all_probs': all_probs,
+        'inference_time': inference_time
+    }
+
+
+# ================================
+# Train and Evaluate All Models
+# ================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+models_dict = {
+    'ViT-LSTM-Attention': ViT_LSTM_Attention
+    #'ViT-LSTM': ViT_LSTM,
+    #'MobileNet-LSTM-Attention': MobileNet_LSTM_Attention,
+    #'MobileNet-LSTM': MobileNet_LSTM,
+    #'VGG16-LSTM': VGG16_LSTM,
+    #'GRU-MobileNet-Attention': GRU_MobileNet_Attention
+}
+results = {}
+for model_name, model_class in models_dict.items():
+    print(f"\n{'=' * 50}")
+    print(f"Training {model_name}")
+    print(f"{'=' * 50}")
+    # Initialize model
+    model = model_class(num_classes=len(train_dataset.classes))
+    # Get model size and parameter count
+    model_size = get_model_size(model)
+    param_count = count_parameters(model)
+    # Train model
+    trained_model, train_acc_history, val_acc_history, training_time, memory_increase = train_model(
+        model, train_loader, val_loader, epochs=50
+    )
+    # Evaluate on all datasets
+    train_results = evaluate_model(trained_model, train_loader, "Train")
+    val_results = evaluate_model(trained_model, val_loader, "Validation")
+    test_results = evaluate_model(trained_model, test_loader, "Test")
+    results[model_name] = {
+        'train': train_results,
+        'val': val_results,
+        'test': test_results,
+        'train_acc_history': train_acc_history,
+        'val_acc_history': val_acc_history,
+        'training_time': training_time,
+        'test_inference_time': test_results['inference_time'],
+        'memory_increase': memory_increase,
+        'model_size': model_size,
+        'param_count': param_count
+    }
+    # Print results
+    print(f"\n{model_name} Results:")
+    print(f"Model Size: {model_size:.2f} MB")
+    print(f"Parameters: {param_count:,}")
+    print(f"Training Time: {training_time:.2f}s")
+    print(f"Memory Increase: {memory_increase:.2f} MB")
+    print(f"Test Inference Time: {test_results['inference_time']:.2f}s")
+    print(f"Train - Acc: {train_results['accuracy']:.4f}, Prec: {train_results['precision']:.4f}, "
+          f"Rec: {train_results['recall']:.4f}, F1: {train_results['f1']:.4f}, AUC: {train_results['auc']:.4f}")
+    print(f"Val   - Acc: {val_results['accuracy']:.4f}, Prec: {val_results['precision']:.4f}, "
+          f"Rec: {val_results['recall']:.4f}, F1: {val_results['f1']:.4f}, AUC: {val_results['auc']:.4f}")
+    print(f"Test  - Acc: {test_results['accuracy']:.4f}, Prec: {test_results['precision']:.4f}, "
+          f"Rec: {test_results['recall']:.4f}, F1: {test_results['f1']:.4f}, AUC: {test_results['auc']:.4f}")
+
+    # Clean up memory
+    del model, trained_model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+# ================================
+# Generate Performance Metrics Plots
+# ================================
+# 1. Training Time Comparison
+plt.figure(figsize=(12, 6))
+model_names = list(results.keys())
+training_times = [results[model]['training_time'] for model in model_names]
+bars = plt.bar(model_names, training_times, color='skyblue')
+plt.title('Training Time Comparison')
+plt.ylabel('Time (seconds)')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', alpha=0.3)
+# Add value labels
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{height:.1f}s', ha='center', va='bottom')
+plt.tight_layout()
+plt.savefig('training_time_comparison.pdf')
+plt.close()
+
+# 2. Inference Time Comparison
+plt.figure(figsize=(12, 6))
+inference_times = [results[model]['test_inference_time'] for model in model_names]
+bars = plt.bar(model_names, inference_times, color='lightgreen')
+plt.title('Test Inference Time Comparison')
+plt.ylabel('Time (seconds)')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', alpha=0.3)
+# Add value labels
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{height:.2f}s', ha='center', va='bottom')
+plt.tight_layout()
+plt.savefig('inference_time_comparison.pdf')
+plt.close()
+
+# 3. Memory Usage Comparison
+plt.figure(figsize=(12, 6))
+memory_usage = [results[model]['memory_increase'] for model in model_names]
+bars = plt.bar(model_names, memory_usage, color='salmon')
+plt.title('Memory Usage Increase During Training')
+plt.ylabel('Memory (MB)')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', alpha=0.3)
+# Add value labels
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{height:.1f}MB', ha='center', va='bottom')
+plt.tight_layout()
+plt.savefig('memory_usage_comparison.pdf')
+plt.close()
+
+# 4. Parameter Count Comparison
+plt.figure(figsize=(12, 6))
+param_counts = [results[model]['param_count'] for model in model_names]
+bars = plt.bar(model_names, param_counts, color='orchid')
+plt.title('Model Parameter Count Comparison')
+plt.ylabel('Number of Parameters')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', alpha=0.3)
+# Add value labels
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{height:,.0f}', ha='center', va='bottom')
+plt.tight_layout()
+plt.savefig('parameter_count_comparison.pdf')
+plt.close()
+
+# 5. Model Size Comparison
+plt.figure(figsize=(12, 6))
+model_sizes = [results[model]['model_size'] for model in model_names]
+bars = plt.bar(model_names, model_sizes, color='gold')
+plt.title('Model Size Comparison')
+plt.ylabel('Size (MB)')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', alpha=0.3)
+# Add value labels
+for bar in bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width() / 2., height,
+             f'{height:.1f}MB', ha='center', va='bottom')
+plt.tight_layout()
+plt.savefig('model_size_comparison.pdf')
+plt.close()
+
+# ================================
+# Generate Other Plots
+# ================================
+# 1. Training/Validation Accuracy Plots
+plt.figure(figsize=(15, 10))
+for i, (model_name, model_results) in enumerate(results.items()):
+    plt.subplot(2, 3, i + 1)
+    plt.plot(model_results['train_acc_history'], label='Train Accuracy', marker='o')
+    plt.plot(model_results['val_acc_history'], label='Validation Accuracy', marker='s')
+    plt.title(f'{model_name}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True)
+plt.tight_layout()
+plt.savefig('all_models_accuracy.pdf')
+plt.close()
+
+# 2. ROC Curves
+plt.figure(figsize=(10, 8))
+for model_name, model_results in results.items():
+    test_results = model_results['test']
+    plt.plot(test_results['fpr'], test_results['tpr'],
+             label=f'{model_name} (AUC = {test_results["auc"]:.3f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curves for All Models')
+plt.legend()
+plt.grid(True)
+plt.savefig('roc_curves.pdf')
+plt.close()
+
+# 3. Confusion Matrices
+for model_name, model_results in results.items():
+    test_results = model_results['test']
+    cm = test_results['confusion_matrix']
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=['Others', 'Monkeypox'],
+                yticklabels=['Others', 'Monkeypox'])
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.savefig(f'confusion_matrix_{model_name.replace("-", "_")}.pdf')
+    plt.close()
+
+# ================================
+# Results Summary Table
+# ================================
+print("\n" + "=" * 120)
+print("COMPREHENSIVE RESULTS SUMMARY")
+print("=" * 120)
+# Create summary table
+summary_data = []
+for model_name, model_results in results.items():
+    test_results = model_results['test']
+    summary_data.append([
+        model_name,
+        f"{test_results['accuracy']:.4f}",
+        f"{test_results['precision']:.4f}",
+        f"{test_results['recall']:.4f}",
+        f"{test_results['f1']:.4f}",
+        f"{test_results['auc']:.4f}",
+        f"{model_results['training_time']:.2f}",
+        f"{model_results['test_inference_time']:.2f}",
+        f"{model_results['memory_increase']:.2f}",
+        f"{model_results['model_size']:.2f}",
+        f"{model_results['param_count']:,}"
+    ])
+# Print table
+headers = ["Model", "Accuracy", "Precision", "Recall", "F1-Score", "AUC",
+           "Train Time(s)", "Inference Time(s)", "Memory(MB)", "Size(MB)", "Parameters"]
+row_format = "{:<25}" + "{:<12}" * 10
+print(row_format.format(*headers))
+print("-" * 150)
+for row in summary_data:
+    print(row_format.format(*row))
+# Save summary table
+with open('comprehensive_results_summary.txt', 'w') as f:
+    f.write("COMPREHENSIVE RESULTS SUMMARY\n")
+    f.write("=" * 120 + "\n")
+    f.write(row_format.format(*headers) + "\n")
+    f.write("-" * 150 + "\n")
+    for row in summary_data:
+        f.write(row_format.format(*row) + "\n")
+print("\n✅ All results saved to PDF files and comprehensive_results_summary.txt")
+print("Files generated:")
+print("- training_time_comparison.pdf")
+print("- inference_time_comparison.pdf")
+print("- memory_usage_comparison.pdf")
+print("- parameter_count_comparison.pdf")
+print("- model_size_comparison.pdf")
+print("- all_models_accuracy.pdf")
+print("- roc_curves.pdf")
+print("- confusion_matrix_*.pdf (for each model)")
+print("- comprehensive_results_summary.txt")
