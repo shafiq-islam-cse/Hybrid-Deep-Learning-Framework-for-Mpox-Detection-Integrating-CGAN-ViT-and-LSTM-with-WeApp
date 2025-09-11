@@ -276,7 +276,7 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-    EPOCHS = 1
+    EPOCHS = 50
     train_acc_history, val_acc_history = [], []
     train_loss_history, val_loss_history = [], []
     total_train_time = 0
