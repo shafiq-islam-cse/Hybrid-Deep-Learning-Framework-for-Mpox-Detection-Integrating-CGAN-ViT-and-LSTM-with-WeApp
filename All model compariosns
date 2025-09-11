@@ -458,11 +458,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 models_dict = {
     'ViT-LSTM-Attention': ViT_LSTM_Attention
-    #'ViT-LSTM': ViT_LSTM,
-    #'MobileNet-LSTM-Attention': MobileNet_LSTM_Attention,
-    #'MobileNet-LSTM': MobileNet_LSTM,
-    #'VGG16-LSTM': VGG16_LSTM,
-    #'GRU-MobileNet-Attention': GRU_MobileNet_Attention
+    'ViT-LSTM': ViT_LSTM,
+    'MobileNet-LSTM-Attention': MobileNet_LSTM_Attention,
+    'MobileNet-LSTM': MobileNet_LSTM,
+    'VGG16-LSTM': VGG16_LSTM,
+    'GRU-MobileNet-Attention': GRU_MobileNet_Attention
 }
 results = {}
 for model_name, model_class in models_dict.items():
