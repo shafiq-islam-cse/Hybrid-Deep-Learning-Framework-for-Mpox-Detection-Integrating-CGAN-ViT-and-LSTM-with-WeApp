@@ -6,4 +6,5 @@ Our Raw data 1428 Monkey Pox and 1764 NonMonkey  and CGAN Augmented data has 400
 Related Link of the data:
 
 Mendele: https://data.mendeley.com/preview/n7g5hyzvg3
+
 Kaggle:https://www.kaggle.com/datasets/shafiqcseiu07/new-hybrid-monkeypox-skin-datasethmsd/data
