@@ -8,3 +8,8 @@ Related Link of the data:
 Mendele: https://data.mendeley.com/datasets/n7g5hyzvg3/1
 
 Kaggle:https://www.kaggle.com/datasets/shafiqcseiu07/new-hybrid-monkeypox-skin-datasethmsd/data
+
+
+Cite the data: 
+
+Islam, Shofiqul ;  Suzon, Mahmud; Rahman, Md Habibur  (2025), “Hybrid Monkeypox Skin Dataset(MMSD)”, Mendeley Data, V1, doi: 10.17632/n7g5hyzvg3.1
